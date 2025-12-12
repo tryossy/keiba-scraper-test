@@ -1,0 +1,110 @@
+name: Monthly Horse Racing Data Scrape
+
+on:
+  # 手動実行を許可
+  workflow_dispatch:
+    inputs:
+      year_month:
+        description: '取得する年月（例: 2024-12）'
+        required: true
+        default: '2024-12'
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360  # 6時間（GitHub最大値）
+
+    steps:
+      - name: リポジトリをチェックアウト
+        uses: actions/checkout@v4
+
+      - name: Python 3.11 のセットアップ
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: 依存関係のインストール
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: 年月の決定
+        id: date
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "year_month=${{ github.event.inputs.year_month }}" >> $GITHUB_OUTPUT
+          else
+            # 前月を取得（スケジュール実行時）
+            echo "year_month=$(date -d 'last month' +%Y-%m)" >> $GITHUB_OUTPUT
+          fi
+
+      - name: データスクレイピング
+        run: |
+          python scrape_monthly.py \
+            --year-month ${{ steps.date.outputs.year_month }} \
+            --output race_data_${{ steps.date.outputs.year_month }}.csv \
+            --interval 1.5
+        env:
+          PYTHONUNBUFFERED: 1
+
+      - name: データサマリーの表示
+        run: |
+          if [ -f "race_data_${{ steps.date.outputs.year_month }}.csv" ]; then
+            echo "=== スクレイピング完了 ==="
+            echo "ファイル: race_data_${{ steps.date.outputs.year_month }}.csv"
+            echo "行数: $(wc -l < race_data_${{ steps.date.outputs.year_month }}.csv)"
+            echo "ファイルサイズ: $(du -h race_data_${{ steps.date.outputs.year_month }}.csv | cut -f1)"
+          else
+            echo "エラー: CSVファイルが生成されませんでした"
+            exit 1
+          fi
+
+      # オプション: Google Drive にアップロード
+      # 使用する場合は GitHub Secrets に RCLONE_CONFIG を設定してください
+      - name: rclone のインストール
+        if: env.RCLONE_CONFIG != ''
+        run: |
+          curl https://rclone.org/install.sh | sudo bash
+        env:
+          RCLONE_CONFIG: ${{ secrets.RCLONE_CONFIG }}
+
+      - name: rclone 設定
+        if: env.RCLONE_CONFIG != ''
+        run: |
+          mkdir -p ~/.config/rclone
+          echo "${{ secrets.RCLONE_CONFIG }}" > ~/.config/rclone/rclone.conf
+        env:
+          RCLONE_CONFIG: ${{ secrets.RCLONE_CONFIG }}
+
+      - name: Google Drive にアップロード
+        if: env.RCLONE_CONFIG != ''
+        run: |
+          rclone copy \
+            race_data_${{ steps.date.outputs.year_month }}.csv \
+            gdrive:keiba-data/${{ steps.date.outputs.year_month }}/
+          echo "Google Drive へのアップロード完了"
+        env:
+          RCLONE_CONFIG: ${{ secrets.RCLONE_CONFIG }}
+
+      # 注意: Publicリポジトリの Artifacts は誰でもダウンロード可能なため、
+      # データをアップロードしません。ログのみ保存します。
+      - name: ログのアップロード（データは含まない）
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: scraping-logs-${{ steps.date.outputs.year_month }}
+          path: |
+            *.log
+          retention-days: 7
+          if-no-files-found: ignore
+
+      - name: スクレイピング結果の通知
+        if: always()
+        run: |
+          if [ -f "race_data_${{ steps.date.outputs.year_month }}.csv" ]; then
+            echo "✅ スクレイピング成功: ${{ steps.date.outputs.year_month }}"
+          else
+            echo "❌ スクレイピング失敗: ${{ steps.date.outputs.year_month }}"
+            exit 1
+          fi

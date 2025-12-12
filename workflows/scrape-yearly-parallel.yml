@@ -1,0 +1,341 @@
+name: Yearly Horse Racing Data Scrape (12 Months Parallel)
+
+on:
+  # 手動実行のみ（年間データの取得は手動トリガー推奨）
+  workflow_dispatch:
+    inputs:
+      year:
+        description: '取得する年（例: 2024）'
+        required: true
+        default: '2024'
+      start_month:
+        description: '開始月（1-12、デフォルト: 1）'
+        required: false
+        default: '1'
+      end_month:
+        description: '終了月（1-12、デフォルト: 12）'
+        required: false
+        default: '12'
+
+jobs:
+  # ジョブ1: 月のマトリックスを生成
+  generate-matrix:
+    runs-on: ubuntu-latest
+    outputs:
+      months: ${{ steps.generate.outputs.months }}
+
+    steps:
+      - name: 月マトリックスを生成
+        id: generate
+        run: |
+          import json
+          import os
+
+          year = int('${{ github.event.inputs.year }}')
+          start_month = int('${{ github.event.inputs.start_month }}')
+          end_month = int('${{ github.event.inputs.end_month }}')
+
+          months = []
+          for month in range(start_month, end_month + 1):
+              months.append({
+                  'year': year,
+                  'month': month,
+                  'year_month': f'{year}-{month:02d}',
+                  'name': f'{year}年{month}月'
+              })
+
+          # GitHub Actions の出力に設定
+          output = json.dumps(months)
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+              f.write(f"months={output}\n")
+
+          print(f"生成された月: {len(months)}個")
+          for m in months:
+              print(f"  {m['name']}: {m['year_month']}")
+
+        shell: python
+
+  # ジョブ2: 並列スクレイピング（最大6ジョブ同時）
+  scrape:
+    needs: generate-matrix
+    runs-on: ubuntu-latest
+    timeout-minutes: 360  # 6時間
+
+    strategy:
+      # 並列実行の設定
+      max-parallel: 6     # 最大6ジョブ同時実行
+      fail-fast: false    # 1つ失敗しても他は続行
+      matrix:
+        month: ${{ fromJson(needs.generate-matrix.outputs.months) }}
+
+    steps:
+      - name: リポジトリをチェックアウト
+        uses: actions/checkout@v4
+
+      - name: Python 3.11 のセットアップ
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: 依存関係のインストール
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: データスクレイピング（${{ matrix.month.name }}）
+        run: |
+          python scrape_monthly.py \
+            --year-month ${{ matrix.month.year_month }} \
+            --output race_data_${{ matrix.month.year_month }}.csv \
+            --interval 1.5
+        env:
+          PYTHONUNBUFFERED: 1
+
+      - name: データサマリーの表示
+        run: |
+          OUTPUT_FILE="race_data_${{ matrix.month.year_month }}.csv"
+          if [ -f "$OUTPUT_FILE" ]; then
+            echo "=== スクレイピング完了: ${{ matrix.month.name }} ==="
+            echo "ファイル: $OUTPUT_FILE"
+            echo "行数: $(wc -l < $OUTPUT_FILE)"
+            echo "ファイルサイズ: $(du -h $OUTPUT_FILE | cut -f1)"
+          else
+            echo "警告: CSVファイルが生成されませんでした"
+          fi
+
+      # Google Drive にアップロード
+      - name: rclone のインストール
+        if: env.RCLONE_CONFIG != ''
+        run: |
+          curl https://rclone.org/install.sh | sudo bash
+        env:
+          RCLONE_CONFIG: ${{ secrets.RCLONE_CONFIG }}
+
+      - name: rclone 設定
+        if: env.RCLONE_CONFIG != ''
+        run: |
+          mkdir -p ~/.config/rclone
+          echo "${{ secrets.RCLONE_CONFIG }}" > ~/.config/rclone/rclone.conf
+        env:
+          RCLONE_CONFIG: ${{ secrets.RCLONE_CONFIG }}
+
+      - name: Google Drive にアップロード
+        if: env.RCLONE_CONFIG != ''
+        run: |
+          OUTPUT_FILE="race_data_${{ matrix.month.year_month }}.csv"
+          if [ -f "$OUTPUT_FILE" ]; then
+            # 年ごとのフォルダに保存
+            rclone copy "$OUTPUT_FILE" gdrive:keiba-data/${{ matrix.month.year }}/
+            echo "Google Drive へのアップロード完了: $OUTPUT_FILE"
+            echo "保存先: gdrive:keiba-data/${{ matrix.month.year }}/$OUTPUT_FILE"
+          fi
+        env:
+          RCLONE_CONFIG: ${{ secrets.RCLONE_CONFIG }}
+
+      # ログのみアップロード（データは含まない）
+      - name: ログのアップロード
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: scraping-logs-${{ matrix.month.year_month }}
+          path: |
+            *.log
+          retention-days: 7
+          if-no-files-found: ignore
+
+  # ジョブ3: 全月のデータを結合（オプション）
+  combine:
+    needs: scrape
+    runs-on: ubuntu-latest
+    if: always()  # scrapeが一部失敗しても実行
+
+    steps:
+      - name: リポジトリをチェックアウト
+        uses: actions/checkout@v4
+
+      - name: Python 3.11 のセットアップ
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: 依存関係のインストール
+        run: |
+          pip install pandas
+
+      - name: rclone のインストール
+        if: env.RCLONE_CONFIG != ''
+        run: |
+          curl https://rclone.org/install.sh | sudo bash
+        env:
+          RCLONE_CONFIG: ${{ secrets.RCLONE_CONFIG }}
+
+      - name: rclone 設定
+        if: env.RCLONE_CONFIG != ''
+        run: |
+          mkdir -p ~/.config/rclone
+          echo "${{ secrets.RCLONE_CONFIG }}" > ~/.config/rclone/rclone.conf
+        env:
+          RCLONE_CONFIG: ${{ secrets.RCLONE_CONFIG }}
+
+      - name: Google Drive から月次データをダウンロード
+        if: env.RCLONE_CONFIG != ''
+        run: |
+          YEAR="${{ github.event.inputs.year }}"
+
+          # Google Drive からダウンロード
+          mkdir -p downloaded_data
+          rclone copy gdrive:keiba-data/$YEAR/ downloaded_data/ --include "*.csv"
+
+          echo "ダウンロード完了:"
+          ls -lh downloaded_data/
+        env:
+          RCLONE_CONFIG: ${{ secrets.RCLONE_CONFIG }}
+
+      - name: CSV ファイルを結合
+        if: env.RCLONE_CONFIG != ''
+        run: |
+          python << 'EOF'
+          import pandas as pd
+          import glob
+          import os
+
+          # 全CSVファイルを読み込み
+          csv_files = sorted(glob.glob('downloaded_data/race_data_*.csv'))
+
+          if csv_files:
+              print(f"結合するファイル: {len(csv_files)}個")
+
+              dfs = []
+              total_rows = 0
+
+              for f in csv_files:
+                  try:
+                      df = pd.read_csv(f, encoding='utf-8-sig')
+                      dfs.append(df)
+                      total_rows += len(df)
+                      print(f"  読み込み: {os.path.basename(f)} ({len(df):,}行)")
+                  except Exception as e:
+                      print(f"  エラー: {os.path.basename(f)} - {e}")
+
+              if dfs:
+                  print(f"\n結合中... (合計 {total_rows:,}行)")
+                  combined = pd.concat(dfs, ignore_index=True)
+
+                  # 重複削除（レースIDでユニーク化）
+                  if 'race_id' in combined.columns:
+                      before = len(combined)
+                      combined = combined.drop_duplicates(subset=['race_id'])
+                      after = len(combined)
+                      print(f"重複削除: {before:,}行 → {after:,}行 ({before-after:,}件削除)")
+
+                  # 日付でソート（存在する場合）
+                  date_cols = [c for c in combined.columns if 'date' in c.lower() or '日付' in c]
+                  if date_cols:
+                      combined = combined.sort_values(date_cols[0])
+                      print(f"ソート: {date_cols[0]} 列")
+
+                  # 保存
+                  year = '${{ github.event.inputs.year }}'
+                  output_file = f'race_data_{year}_combined.csv'
+                  combined.to_csv(output_file, index=False, encoding='utf-8-sig')
+
+                  print(f"\n結合完了:")
+                  print(f"  ファイル: {output_file}")
+                  print(f"  行数: {len(combined):,}")
+                  print(f"  列数: {len(combined.columns)}")
+                  print(f"  ファイルサイズ: {os.path.getsize(output_file) / 1024 / 1024:.2f} MB")
+              else:
+                  print("結合可能なデータがありません")
+          else:
+              print("CSVファイルが見つかりません")
+          EOF
+
+      - name: 結合データを Google Drive にアップロード
+        if: env.RCLONE_CONFIG != ''
+        run: |
+          YEAR="${{ github.event.inputs.year }}"
+          COMBINED_FILE="race_data_${YEAR}_combined.csv"
+
+          if [ -f "$COMBINED_FILE" ]; then
+            rclone copy "$COMBINED_FILE" gdrive:keiba-data/$YEAR/
+            echo "結合データのアップロード完了: $COMBINED_FILE"
+            echo "保存先: gdrive:keiba-data/$YEAR/$COMBINED_FILE"
+          fi
+        env:
+          RCLONE_CONFIG: ${{ secrets.RCLONE_CONFIG }}
+
+      - name: 統計情報の生成
+        if: env.RCLONE_CONFIG != ''
+        run: |
+          python << 'EOF'
+          import pandas as pd
+          import json
+          import os
+
+          year = '${{ github.event.inputs.year }}'
+          combined_file = f'race_data_{year}_combined.csv'
+
+          if os.path.exists(combined_file):
+              df = pd.read_csv(combined_file, encoding='utf-8-sig')
+
+              stats = {
+                  'year': year,
+                  'total_races': len(df),
+                  'total_columns': len(df.columns),
+                  'file_size_mb': round(os.path.getsize(combined_file) / 1024 / 1024, 2),
+                  'columns': list(df.columns)
+              }
+
+              # 月別統計（日付列がある場合）
+              date_cols = [c for c in df.columns if 'date' in c.lower() or '日付' in c]
+              if date_cols:
+                  df['_month'] = pd.to_datetime(df[date_cols[0]], errors='coerce').dt.month
+                  monthly_counts = df['_month'].value_counts().sort_index().to_dict()
+                  stats['monthly_counts'] = {f'{year}-{int(k):02d}': int(v) for k, v in monthly_counts.items() if pd.notna(k)}
+
+              # 統計情報を保存
+              stats_file = f'stats_{year}.json'
+              with open(stats_file, 'w', encoding='utf-8') as f:
+                  json.dump(stats, f, ensure_ascii=False, indent=2)
+
+              print(f"\n統計情報:")
+              print(json.dumps(stats, ensure_ascii=False, indent=2))
+          EOF
+
+      - name: 統計情報を Google Drive にアップロード
+        if: env.RCLONE_CONFIG != ''
+        run: |
+          YEAR="${{ github.event.inputs.year }}"
+          STATS_FILE="stats_${YEAR}.json"
+
+          if [ -f "$STATS_FILE" ]; then
+            rclone copy "$STATS_FILE" gdrive:keiba-data/$YEAR/
+            echo "統計情報のアップロード完了: $STATS_FILE"
+          fi
+        env:
+          RCLONE_CONFIG: ${{ secrets.RCLONE_CONFIG }}
+
+      - name: 完了通知
+        if: always()
+        run: |
+          YEAR="${{ github.event.inputs.year }}"
+          COMBINED_FILE="race_data_${YEAR}_combined.csv"
+
+          echo "=== 年次スクレイピング完了 ==="
+          echo "対象年: $YEAR"
+
+          if [ -f "$COMBINED_FILE" ]; then
+            echo "✅ 結合データ作成成功"
+            echo "ファイル: $COMBINED_FILE"
+            echo "行数: $(wc -l < $COMBINED_FILE)"
+            echo "ファイルサイズ: $(du -h $COMBINED_FILE | cut -f1)"
+          else
+            echo "⚠️ 結合データの作成に失敗または実行されませんでした"
+          fi
+
+          echo ""
+          echo "保存先: Google Drive (keiba-data/$YEAR/)"
+          echo "  - race_data_YYYY-MM.csv (各月)"
+          echo "  - race_data_${YEAR}_combined.csv (全月結合)"
+          echo "  - stats_${YEAR}.json (統計情報)"

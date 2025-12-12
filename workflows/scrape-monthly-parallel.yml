@@ -1,0 +1,377 @@
+name: Monthly Horse Racing Data Scrape (Parallel)
+
+on:
+
+  # 手動実行を許可
+  workflow_dispatch:
+    inputs:
+      year_month:
+        description: '取得する年月（例: 2024-12）'
+        required: true
+        default: '2024-12'
+      split_weeks:
+        description: '週単位で分割するか（true/false）'
+        required: false
+        default: 'true'
+
+jobs:
+  # ジョブ1: 期間を生成してマトリックスを作成
+  generate-matrix:
+    runs-on: ubuntu-latest
+    outputs:
+      date_ranges: ${{ steps.generate.outputs.date_ranges }}
+
+    steps:
+      - name: リポジトリをチェックアウト
+        uses: actions/checkout@v4
+
+      - name: Python 3.11 のセットアップ
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: 期間マトリックスを生成
+        id: generate
+        run: |
+          import json
+          import sys
+          from datetime import datetime, timedelta
+
+          # 年月の取得
+          if '${{ github.event_name }}' == 'workflow_dispatch':
+              year_month = '${{ github.event.inputs.year_month }}'
+              split_weeks = '${{ github.event.inputs.split_weeks }}' == 'true'
+          else:
+              # 前月を取得
+              now = datetime.now()
+              if now.month == 1:
+                  year_month = f"{now.year - 1}-12"
+              else:
+                  year_month = f"{now.year}-{now.month - 1:02d}"
+              split_weeks = True
+
+          year, month = map(int, year_month.split('-'))
+
+          # 月の開始日と終了日
+          first_day = datetime(year, month, 1)
+          if month == 12:
+              last_day = datetime(year + 1, 1, 1) - timedelta(days=1)
+          else:
+              last_day = datetime(year, month + 1, 1) - timedelta(days=1)
+
+          date_ranges = []
+
+          if split_weeks:
+              # 週単位で分割（土日を含む週）
+              current_date = first_day
+              week_num = 1
+
+              while current_date <= last_day:
+                  # 週の開始（土曜日を探す）
+                  while current_date.weekday() != 5 and current_date <= last_day:  # 5 = 土曜日
+                      current_date += timedelta(days=1)
+
+                  if current_date > last_day:
+                      break
+
+                  week_start = current_date
+
+                  # 週の終了（次の日曜日）
+                  week_end = week_start + timedelta(days=1)  # 日曜日
+                  if week_end > last_day:
+                      week_end = last_day
+
+                  date_ranges.append({
+                      'name': f'week{week_num}',
+                      'start_date': week_start.strftime('%Y-%m-%d'),
+                      'end_date': week_end.strftime('%Y-%m-%d'),
+                      'year_month': year_month
+                  })
+
+                  week_num += 1
+                  current_date = week_end + timedelta(days=1)
+          else:
+              # 月全体を1ジョブで実行
+              date_ranges.append({
+                  'name': 'full_month',
+                  'start_date': first_day.strftime('%Y-%m-%d'),
+                  'end_date': last_day.strftime('%Y-%m-%d'),
+                  'year_month': year_month
+              })
+
+          # GitHub Actions の出力に設定
+          output = json.dumps(date_ranges)
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+              f.write(f"date_ranges={output}\n")
+
+          print(f"生成された期間: {len(date_ranges)}個")
+          for dr in date_ranges:
+              print(f"  {dr['name']}: {dr['start_date']} ~ {dr['end_date']}")
+
+        shell: python
+        env:
+          PYTHONUNBUFFERED: 1
+
+  # ジョブ2: 並列スクレイピング
+  scrape:
+    needs: generate-matrix
+    runs-on: ubuntu-latest
+    timeout-minutes: 360  # 6時間
+
+    strategy:
+      # 並列実行の設定
+      max-parallel: 4  # 最大4ジョブ同時実行（サーバー負荷を考慮）
+      fail-fast: false  # 1つ失敗しても他は続行
+      matrix:
+        range: ${{ fromJson(needs.generate-matrix.outputs.date_ranges) }}
+
+    steps:
+      - name: リポジトリをチェックアウト
+        uses: actions/checkout@v4
+
+      - name: Python 3.11 のセットアップ
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: 依存関係のインストール
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: スクレイピング期間スクリプトの作成
+        run: |
+          cat > scrape_date_range.py << 'EOF'
+          """日付範囲指定スクレイピング"""
+          import argparse
+          from datetime import datetime, timedelta
+          import pandas as pd
+          from scrape_monthly import MonthlyRaceScraper
+
+          def main():
+              parser = argparse.ArgumentParser()
+              parser.add_argument('--start-date', required=True)
+              parser.add_argument('--end-date', required=True)
+              parser.add_argument('--output', required=True)
+              parser.add_argument('--interval', type=float, default=1.5)
+              args = parser.parse_args()
+
+              start = datetime.strptime(args.start_date, '%Y-%m-%d')
+              end = datetime.strptime(args.end_date, '%Y-%m-%d')
+
+              scraper = MonthlyRaceScraper(min_interval=args.interval)
+
+              print(f"期間: {args.start_date} ~ {args.end_date}")
+
+              all_data = []
+              current_date = start
+
+              while current_date <= end:
+                  year, month, day = current_date.year, current_date.month, current_date.day
+
+                  # その日のレースIDを生成（簡易版）
+                  date_str = current_date.strftime('%Y%m%d')
+
+                  # 土日のみ処理（週末レース）
+                  if current_date.weekday() in [5, 6]:
+                      for place_code in ['01', '02', '03', '04', '05', '06', '07', '08', '09', '10']:
+                          for race_num in range(1, 13):
+                              race_id = f"{date_str}{place_code}{race_num:02d}"
+                              data = scraper.scrape_race(race_id)
+                              if data:
+                                  all_data.append(data)
+
+                  current_date += timedelta(days=1)
+
+              if all_data:
+                  df = pd.DataFrame(all_data)
+                  df.to_csv(args.output, index=False, encoding='utf-8-sig')
+                  print(f"保存完了: {args.output} ({len(df)}行)")
+              else:
+                  print("データが取得できませんでした")
+
+          if __name__ == '__main__':
+              main()
+          EOF
+
+      - name: データスクレイピング（${{ matrix.range.name }}）
+        run: |
+          python scrape_date_range.py \
+            --start-date ${{ matrix.range.start_date }} \
+            --end-date ${{ matrix.range.end_date }} \
+            --output race_data_${{ matrix.range.year_month }}_${{ matrix.range.name }}.csv \
+            --interval 1.5
+        env:
+          PYTHONUNBUFFERED: 1
+
+      - name: データサマリーの表示
+        run: |
+          OUTPUT_FILE="race_data_${{ matrix.range.year_month }}_${{ matrix.range.name }}.csv"
+          if [ -f "$OUTPUT_FILE" ]; then
+            echo "=== スクレイピング完了: ${{ matrix.range.name }} ==="
+            echo "期間: ${{ matrix.range.start_date }} ~ ${{ matrix.range.end_date }}"
+            echo "ファイル: $OUTPUT_FILE"
+            echo "行数: $(wc -l < $OUTPUT_FILE)"
+            echo "ファイルサイズ: $(du -h $OUTPUT_FILE | cut -f1)"
+          else
+            echo "警告: CSVファイルが生成されませんでした（レースがない可能性）"
+          fi
+
+      # オプション: Google Drive にアップロード
+      - name: rclone のインストール
+        if: env.RCLONE_CONFIG != ''
+        run: |
+          curl https://rclone.org/install.sh | sudo bash
+        env:
+          RCLONE_CONFIG: ${{ secrets.RCLONE_CONFIG }}
+
+      - name: rclone 設定
+        if: env.RCLONE_CONFIG != ''
+        run: |
+          mkdir -p ~/.config/rclone
+          echo "${{ secrets.RCLONE_CONFIG }}" > ~/.config/rclone/rclone.conf
+        env:
+          RCLONE_CONFIG: ${{ secrets.RCLONE_CONFIG }}
+
+      - name: Google Drive にアップロード
+        if: env.RCLONE_CONFIG != ''
+        run: |
+          OUTPUT_FILE="race_data_${{ matrix.range.year_month }}_${{ matrix.range.name }}.csv"
+          if [ -f "$OUTPUT_FILE" ]; then
+            rclone copy "$OUTPUT_FILE" gdrive:keiba-data/${{ matrix.range.year_month }}/
+            echo "Google Drive へのアップロード完了: $OUTPUT_FILE"
+          fi
+        env:
+          RCLONE_CONFIG: ${{ secrets.RCLONE_CONFIG }}
+
+      # ログのみアップロード（データは含まない）
+      - name: ログのアップロード
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: scraping-logs-${{ matrix.range.year_month }}-${{ matrix.range.name }}
+          path: |
+            *.log
+          retention-days: 7
+          if-no-files-found: ignore
+
+  # ジョブ3: 全ての週のデータを結合（オプション）
+  combine:
+    needs: scrape
+    runs-on: ubuntu-latest
+    if: always()  # scrapeが一部失敗しても実行
+
+    steps:
+      - name: リポジトリをチェックアウト
+        uses: actions/checkout@v4
+
+      - name: Python 3.11 のセットアップ
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: rclone のインストール
+        if: env.RCLONE_CONFIG != ''
+        run: |
+          curl https://rclone.org/install.sh | sudo bash
+        env:
+          RCLONE_CONFIG: ${{ secrets.RCLONE_CONFIG }}
+
+      - name: rclone 設定
+        if: env.RCLONE_CONFIG != ''
+        run: |
+          mkdir -p ~/.config/rclone
+          echo "${{ secrets.RCLONE_CONFIG }}" > ~/.config/rclone/rclone.conf
+        env:
+          RCLONE_CONFIG: ${{ secrets.RCLONE_CONFIG }}
+
+      - name: Google Drive から週次データをダウンロード
+        if: env.RCLONE_CONFIG != ''
+        run: |
+          # 年月を取得
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            YEAR_MONTH="${{ github.event.inputs.year_month }}"
+          else
+            YEAR_MONTH=$(date -d 'last month' +%Y-%m)
+          fi
+
+          # Google Drive からダウンロード
+          mkdir -p downloaded_data
+          rclone copy gdrive:keiba-data/$YEAR_MONTH/ downloaded_data/ --include "*.csv"
+
+          echo "ダウンロード完了:"
+          ls -lh downloaded_data/
+        env:
+          RCLONE_CONFIG: ${{ secrets.RCLONE_CONFIG }}
+
+      - name: CSV ファイルを結合
+        if: env.RCLONE_CONFIG != ''
+        run: |
+          pip install pandas
+
+          python << 'EOF'
+          import pandas as pd
+          import glob
+          import os
+
+          # 全CSVファイルを読み込み
+          csv_files = glob.glob('downloaded_data/*.csv')
+
+          if csv_files:
+              print(f"結合するファイル: {len(csv_files)}個")
+
+              dfs = []
+              for f in csv_files:
+                  try:
+                      df = pd.read_csv(f, encoding='utf-8-sig')
+                      dfs.append(df)
+                      print(f"  読み込み: {f} ({len(df)}行)")
+                  except Exception as e:
+                      print(f"  エラー: {f} - {e}")
+
+              if dfs:
+                  combined = pd.concat(dfs, ignore_index=True)
+
+                  # 重複削除（レースIDでユニーク化）
+                  if 'race_id' in combined.columns:
+                      combined = combined.drop_duplicates(subset=['race_id'])
+
+                  # 保存
+                  output_file = 'race_data_combined.csv'
+                  combined.to_csv(output_file, index=False, encoding='utf-8-sig')
+                  print(f"\n結合完了: {output_file} ({len(combined)}行)")
+              else:
+                  print("結合可能なデータがありません")
+          else:
+              print("CSVファイルが見つかりません")
+          EOF
+
+      - name: 結合データを Google Drive にアップロード
+        if: env.RCLONE_CONFIG != ''
+        run: |
+          if [ -f "race_data_combined.csv" ]; then
+            # 年月を取得
+            if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+              YEAR_MONTH="${{ github.event.inputs.year_month }}"
+            else
+              YEAR_MONTH=$(date -d 'last month' +%Y-%m)
+            fi
+
+            rclone copy race_data_combined.csv gdrive:keiba-data/$YEAR_MONTH/
+            echo "結合データのアップロード完了"
+          fi
+        env:
+          RCLONE_CONFIG: ${{ secrets.RCLONE_CONFIG }}
+
+      - name: 完了通知
+        if: always()
+        run: |
+          echo "=== 月次スクレイピング完了 ==="
+          if [ -f "race_data_combined.csv" ]; then
+            echo "✅ 結合データ作成成功"
+            echo "ファイル: race_data_combined.csv"
+            echo "行数: $(wc -l < race_data_combined.csv)"
+          else
+            echo "⚠️ 結合データの作成に失敗または実行されませんでした"
+          fi

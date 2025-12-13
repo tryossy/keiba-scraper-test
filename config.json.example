@@ -1,0 +1,8 @@
+{
+  "request_settings": {
+    "min_interval": 1.5,
+    "max_requests_per_day": 40,
+    "max_requests_weekday": 8000,
+    "max_requests_weekend": 150
+  }
+}

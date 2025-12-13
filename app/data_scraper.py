@@ -13,20 +13,189 @@ from datetime import datetime, timedelta
 import random
 import re
 from pathlib import Path
+from urllib3.util.retry import Retry
+from requests.adapters import HTTPAdapter
 
 # config読み込み
-with open('config.json', 'r', encoding='utf-8') as f:
+config_path = Path(__file__).parent.parent / 'config.json'
+if not config_path.exists():
+    # GitHub Actionsなどで実行される場合はカレントディレクトリから
+    config_path = Path('config.json')
+with open(config_path, 'r', encoding='utf-8') as f:
     config = json.load(f)
 
-# keiba_tool_mainから必要な関数をインポート
-import sys
-from pathlib import Path
-sys.path.insert(0, str(Path(__file__).parent.parent))
-from app.keiba_tool_main import (
-    safe_request,
-    get_request_status,
-    get_race_ids
-)
+# ===== リクエスト管理用のグローバル変数 =====
+last_request_time = 0
+request_count = 0
+request_count_date = None
+
+# 設定から取得（デフォルト値あり）
+request_settings = config.get('request_settings', {})
+MIN_REQUEST_INTERVAL = request_settings.get('min_interval', 1.5)
+MAX_REQUESTS_WEEKDAY = request_settings.get('max_requests_weekday', 8000)
+MAX_REQUESTS_WEEKEND = request_settings.get('max_requests_weekend', 150)
+
+def create_session():
+    """スクレイピング対策を施したセッションを作成"""
+    session = requests.Session()
+
+    # User-Agentのランダム化
+    user_agents = [
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36',
+        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    ]
+    session.headers.update({
+        'User-Agent': random.choice(user_agents),
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+        'Accept-Language': 'ja,en-US;q=0.9,en;q=0.8',
+        'Accept-Encoding': 'gzip, deflate, br',
+        'Connection': 'keep-alive',
+        'Upgrade-Insecure-Requests': '1',
+    })
+
+    # リトライ戦略
+    retry_strategy = Retry(
+        total=3,
+        backoff_factor=1,
+        status_forcelist=[429, 500, 502, 503, 504],
+    )
+    adapter = HTTPAdapter(max_retries=retry_strategy)
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+
+    return session
+
+# グローバルセッション（再利用して接続を維持）
+session = create_session()
+
+def get_max_requests_for_today():
+    """今日のリクエスト上限を取得（平日/土日で分ける）"""
+    today = datetime.now().date()
+    is_weekend = today.weekday() >= 5
+    return MAX_REQUESTS_WEEKEND if is_weekend else MAX_REQUESTS_WEEKDAY
+
+def reset_request_count_if_needed():
+    """日付が変わったらリクエスト数をリセット"""
+    global request_count, request_count_date
+    today = datetime.now().date()
+    if request_count_date != today:
+        request_count = 0
+        request_count_date = today
+        print(f"[リクエストカウントリセット] 日付: {today}, 上限: {get_max_requests_for_today()}")
+
+def get_request_status():
+    """現在のリクエスト状態を取得"""
+    reset_request_count_if_needed()
+    max_requests = get_max_requests_for_today()
+    remaining = max_requests - request_count
+    today = datetime.now().date()
+    is_weekend = today.weekday() >= 5
+    return {
+        'count': request_count,
+        'max': max_requests,
+        'remaining': remaining,
+        'date': request_count_date,
+        'is_weekend': is_weekend,
+        'type': 'weekend' if is_weekend else 'weekday'
+    }
+
+def safe_request(url, max_retries=3, timeout=None):
+    """
+    スクレイピング対策を施した安全なリクエスト関数
+
+    Args:
+        url: リクエスト先URL
+        max_retries: 最大リトライ回数
+        timeout: タイムアウト時間（秒）
+
+    Returns:
+        Responseオブジェクト（失敗時はNone）
+    """
+    global last_request_time, request_count
+
+    reset_request_count_if_needed()
+
+    max_requests = get_max_requests_for_today()
+    if request_count >= max_requests:
+        today = datetime.now().date()
+        is_weekend = today.weekday() >= 5
+        print(f"[警告] リクエスト上限に到達 ({request_count}/{max_requests}, {'週末' if is_weekend else '平日'})")
+        return None
+
+    # レート制限（最小間隔を確保）
+    current_time = time.time()
+    elapsed = current_time - last_request_time
+    if elapsed < MIN_REQUEST_INTERVAL:
+        wait_time = MIN_REQUEST_INTERVAL - elapsed
+        time.sleep(wait_time)
+
+    # タイムアウト設定
+    if timeout is None:
+        timeout = config.get('timeouts', {}).get('scraping', 10)
+
+    for attempt in range(max_retries):
+        try:
+            response = session.get(url, timeout=timeout)
+            last_request_time = time.time()
+            request_count += 1
+
+            if response.status_code == 200:
+                return response
+            elif response.status_code == 404:
+                print(f"[404] ページが見つかりません: {url}")
+                return None
+            else:
+                print(f"[エラー] ステータスコード {response.status_code}: {url}")
+                if attempt < max_retries - 1:
+                    wait_time = 2 ** attempt
+                    print(f"  {wait_time}秒後にリトライ...")
+                    time.sleep(wait_time)
+        except Exception as e:
+            print(f"[リクエストエラー] {e}")
+            if attempt < max_retries - 1:
+                wait_time = 2 ** attempt
+                print(f"  {wait_time}秒後にリトライ...")
+                time.sleep(wait_time)
+
+    return None
+
+def get_race_ids(kaisai_date):
+    """
+    指定日のレースID一覧を取得
+
+    Args:
+        kaisai_date: 開催日（例: '20241123'）
+
+    Returns:
+        list[str]: レースIDのリスト
+    """
+    url = f'https://race.netkeiba.com/top/race_list_sub.html?kaisai_date={kaisai_date}'
+    response = safe_request(url)
+
+    if not response:
+        print(f"レースID取得失敗: {url}")
+        return []
+
+    try:
+        try:
+            soup = BeautifulSoup(response.content, 'lxml')
+        except:
+            soup = BeautifulSoup(response.content, 'html.parser')
+
+        race_ids = []
+        for a_tag in soup.select('li.RaceList_DataItem a[href*="/race/"]'):
+            href = a_tag.get('href', '')
+            match = re.search(r'/race/(\d+)', href)
+            if match:
+                race_id = match.group(1)
+                if race_id not in race_ids:
+                    race_ids.append(race_id)
+
+        return race_ids
+    except Exception as e:
+        print(f"レースID解析エラー ({kaisai_date}): {e}")
+        return []
 
 def get_kaisai_dates(year, month):
     """

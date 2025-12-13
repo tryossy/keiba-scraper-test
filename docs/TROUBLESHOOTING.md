@@ -2,7 +2,41 @@
 
 ## GitHub Actions でのエラー解決
 
-### エラー1: `keibascraper がインストールされていません`
+### エラー1: `RCLONE_CONFIG: file name too long`
+
+**エラーメッセージ:**
+```
+Failed to load config file "...(long token)...": open ...: file name too long
+```
+
+**原因:**
+- `echo "${{ secrets.RCLONE_CONFIG }}" > ~/.config/rclone/rclone.conf` で設定内容がファイルパスとして解釈される
+- シークレットの内容が長すぎてパス名制限を超える
+
+**解決方法:**
+
+ワークフローファイルの `rclone 設定` ステップを以下のように修正:
+
+```yaml
+- name: rclone 設定
+  if: env.RCLONE_CONFIG != ''
+  run: |
+    mkdir -p ~/.config/rclone
+    cat > ~/.config/rclone/rclone.conf << 'EOF'
+    ${{ secrets.RCLONE_CONFIG }}
+    EOF
+  env:
+    RCLONE_CONFIG: ${{ secrets.RCLONE_CONFIG }}
+```
+
+**ポイント:**
+- `echo` の代わりに `cat` とヒアドキュメント (`<< 'EOF'`) を使用
+- シングルクォート `'EOF'` で変数展開を防ぐ
+- `${{ secrets.RCLONE_CONFIG }}` はGitHub Actionsが展開
+
+---
+
+### エラー2: `keibascraper がインストールされていません`
 
 **エラーメッセージ:**
 ```

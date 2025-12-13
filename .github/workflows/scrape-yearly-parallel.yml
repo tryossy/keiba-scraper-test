@@ -138,7 +138,9 @@ jobs:
         if: env.RCLONE_CONFIG != ''
         run: |
           mkdir -p ~/.config/rclone
-          echo "${{ secrets.RCLONE_CONFIG }}" > ~/.config/rclone/rclone.conf
+          cat > ~/.config/rclone/rclone.conf << 'EOF'
+          ${{ secrets.RCLONE_CONFIG }}
+          EOF
         env:
           RCLONE_CONFIG: ${{ secrets.RCLONE_CONFIG }}
 

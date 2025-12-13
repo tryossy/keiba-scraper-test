@@ -186,7 +186,7 @@ def get_race_ids(kaisai_date):
         race_ids = []
         for a_tag in soup.select('li.RaceList_DataItem a[href*="/race/"]'):
             href = a_tag.get('href', '')
-            match = re.search(r'/race/(\d+)', href)
+            match = re.search(r'race_id=(\d+)', href)
             if match:
                 race_id = match.group(1)
                 if race_id not in race_ids:
@@ -722,11 +722,22 @@ def scrape_date_range(start_date, end_date, scrape_horses=True, scrape_peds=True
         print(f"\n{'='*80}")
         print(f"処理中: {current_date.strftime('%Y-%m-%d (%A)')}{date_type}")
         print(f"{'='*80}")
-        
-        # 開催日を取得
+
+        # 開催カレンダーから実際の開催日を確認
+        year = current_date.year
+        month = current_date.month
+        kaisai_dates_in_month = get_kaisai_dates(year, month)
         kaisai_date = current_date.strftime('%Y%m%d')
+
+        # 開催日でない場合はスキップ
+        if kaisai_date not in kaisai_dates_in_month:
+            print(f"  [スキップ] レース開催日ではありません")
+            current_date += timedelta(days=1)
+            continue
+
+        # レースIDを取得
         race_ids = get_race_ids(kaisai_date)
-        
+
         if not race_ids:
             print(f"  [警告] レースが見つかりませんでした")
             current_date += timedelta(days=1)

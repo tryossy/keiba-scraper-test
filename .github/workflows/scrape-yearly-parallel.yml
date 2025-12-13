@@ -159,8 +159,6 @@ jobs:
           else
             echo "警告: data/html/race ディレクトリが存在しません"
           fi
-        env:
-          RCLONE_CONFIG: ${{ secrets.RCLONE_CONFIG }}
 
       # ログのみアップロード（データは含まない）
       - name: ログのアップロード

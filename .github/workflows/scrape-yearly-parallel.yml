@@ -135,7 +135,6 @@ jobs:
           RCLONE_CONFIG: ${{ secrets.RCLONE_CONFIG }}
 
       - name: rclone 設定
-        if: env.RCLONE_CONFIG != ''
         env:
           RCLONE_CONFIG: ${{ secrets.RCLONE_CONFIG }}
         run: |
@@ -144,18 +143,30 @@ jobs:
           echo "rclone設定完了"
 
       - name: Google Drive にアップロード
-        if: env.RCLONE_CONFIG != ''
         run: |
           # data/html/race/ 配下の該当月のファイルをアップロード
           if [ -d "data/html/race" ]; then
             MONTH_PREFIX="${{ matrix.month.year }}$(printf '%02d' ${{ matrix.month.month }})"
-            rclone copy \
-              data/html/race/ \
-              gdrive:keiba-data/html/race/ \
-              --include "${MONTH_PREFIX}*.bin"
 
-            echo "Google Drive へのアップロード完了"
-            echo "保存先: gdrive:keiba-data/html/race/"
+            # デバッグ: アップロード対象のファイル数を確認
+            FILE_COUNT=$(ls data/html/race/${MONTH_PREFIX}*.bin 2>/dev/null | wc -l)
+            echo "アップロード対象ファイル数: ${FILE_COUNT}"
+
+            if [ "$FILE_COUNT" -gt 0 ]; then
+              echo "アップロード開始: ${MONTH_PREFIX}*.bin"
+              rclone copy \
+                data/html/race/ \
+                gdrive:keiba-data/html/race/ \
+                --include "${MONTH_PREFIX}*.bin" \
+                --progress
+
+              echo "Google Drive へのアップロード完了"
+              echo "保存先: gdrive:keiba-data/html/race/"
+            else
+              echo "警告: ${MONTH_PREFIX}*.bin に一致するファイルが見つかりませんでした"
+              echo "data/html/race/ の内容:"
+              ls -lh data/html/race/ || echo "ディレクトリは空です"
+            fi
           else
             echo "警告: data/html/race ディレクトリが存在しません"
           fi

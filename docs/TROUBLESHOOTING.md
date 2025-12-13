@@ -20,17 +20,18 @@ Failed to load config file "...(long token)...": open ...: file name too long
 ```yaml
 - name: rclone 設定
   if: env.RCLONE_CONFIG != ''
-  run: |
-    mkdir -p ~/.config/rclone
-    printf '%s\n' "$RCLONE_CONFIG" > ~/.config/rclone/rclone.conf
   env:
     RCLONE_CONFIG: ${{ secrets.RCLONE_CONFIG }}
+  run: |
+    mkdir -p ~/.config/rclone
+    echo "$RCLONE_CONFIG" > ~/.config/rclone/rclone.conf
+    echo "rclone設定完了"
 ```
 
 **ポイント:**
-- `echo` の代わりに `printf '%s\n'` を使用して改行を明示的に追加
-- 環境変数 `$RCLONE_CONFIG` を直接展開
-- `printf` は特殊文字を正しく処理する
+- `env` セクションを `run` の**前**に配置
+- ダブルクォートで環境変数を囲む: `"$RCLONE_CONFIG"`
+- 既存の動作するワークフローと同じ形式を使用
 
 ---
 
